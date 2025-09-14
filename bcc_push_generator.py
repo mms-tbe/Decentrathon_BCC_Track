@@ -281,23 +281,33 @@ class BCCPushNotificationGenerator:
         """Analyze transfer patterns"""
         if transfers_df.empty:
             return {}
-        
+
         # Income vs expenses
         income = transfers_df[transfers_df['direction'] == 'in']['amount'].sum()
         expenses = transfers_df[transfers_df['direction'] == 'out']['amount'].sum()
-        
+
         # ATM withdrawals
         atm_count = len(transfers_df[transfers_df['type'] == 'atm_withdrawal'])
         atm_amount = transfers_df[transfers_df['type'] == 'atm_withdrawal']['amount'].sum()
-        
+
         # Loan/credit activity
         loan_types = ['loan_payment_out', 'cc_repayment_out', 'installment_payment_out']
         loan_transfers = transfers_df[transfers_df['type'].isin(loan_types)]
         loan_payments = loan_transfers['amount'].sum()
-        
+
         # P2P transfers
         p2p_count = len(transfers_df[transfers_df['type'] == 'p2p_out'])
-        
+
+        # Monthly cashflow analysis
+        monthly_cashflow = {}
+        if 'date' in transfers_df.columns:
+            transfers_df['month'] = transfers_df['date'].dt.to_period('M')
+            monthly_income = transfers_df[transfers_df['direction'] == 'in'].groupby('month')['amount'].sum()
+            monthly_expenses = transfers_df[transfers_df['direction'] == 'out'].groupby('month')['amount'].sum()
+            monthly_net = monthly_income.subtract(monthly_expenses, fill_value=0)
+            monthly_cashflow = monthly_net.to_dict()
+
+
         return {
             'total_income': income,
             'total_expenses': expenses,
@@ -306,7 +316,8 @@ class BCCPushNotificationGenerator:
             'atm_amount': atm_amount,
             'loan_payments': loan_payments,
             'has_installments': loan_payments > 0,
-            'p2p_count': p2p_count
+            'p2p_count': p2p_count,
+            'monthly_cashflow': monthly_cashflow
         }
     
     def _analyze_fx_activity(self, trans_df, transfers_df):
@@ -343,138 +354,100 @@ class BCCPushNotificationGenerator:
         }
     
     def calculate_product_scores(self, analysis):
-        """Calculate scores for each product"""
+        """Calculate scores for each product based on signals"""
         scores = {}
-        
-        # Travel Card
+
+        # 1. Карта для путешествий
         travel_score = 0
-        if analysis['transaction_stats']:
-            travel_spend = analysis['transaction_stats'].get('travel_spend', 0)
-            total_spend = analysis['transaction_stats'].get('total_spend', 1)
-            travel_ratio = (travel_spend / total_spend) if total_spend > 0 else 0
-            travel_score = travel_ratio * 100
-            
-            # Bonus for FX activity
-            if analysis['fx_activity']['has_fx_activity']:
-                travel_score += 20
-            
-            # Bonus for frequent taxi use
-            if 'category_spend' in analysis['transaction_stats']:
-                taxi_spend = analysis['transaction_stats']['category_spend'].get('Такси', 0)
-                if taxi_spend > 20000:
-                    travel_score += 15
-        
-        scores['travel_card'] = min(travel_score, 100)
-        
-        # Premium Card
-        premium_score = 0
-        if analysis['avg_balance'] > 500000:
-            premium_score += 40
-        if analysis['avg_balance'] > 1000000:
-            premium_score += 20
-        
-        if analysis['transaction_stats']:
-            premium_spend = analysis['transaction_stats'].get('premium_spend', 0)
-            total_spend = analysis['transaction_stats'].get('total_spend', 1)
-            premium_ratio = (premium_spend / total_spend) if total_spend > 0 else 0
-            premium_score += premium_ratio * 30
-        
-        if analysis['transfer_stats']:
-            if analysis['transfer_stats'].get('atm_count', 0) > 5:
-                premium_score += 15
-            if analysis['transfer_stats'].get('p2p_count', 0) > 10:
-                premium_score += 10
-        
-        scores['premium_card'] = min(premium_score, 100)
-        
-        # Credit Card
-        credit_score = 0
-        if analysis['transaction_stats']:
-            # Diverse spending categories
-            if len(analysis['transaction_stats'].get('top_categories', [])) >= 3:
-                credit_score += 30
-            
-            # Online services usage
-            online_spend = analysis['transaction_stats'].get('online_spend', 0)
-            total_spend = analysis['transaction_stats'].get('total_spend', 1)
-            online_ratio = (online_spend / total_spend) if total_spend > 0 else 0
-            credit_score += online_ratio * 40
-            
-            # Transaction frequency
-            if analysis['transaction_stats'].get('transaction_count', 0) > 50:
-                credit_score += 15
-        
-        if analysis['transfer_stats'] and analysis['transfer_stats'].get('has_installments', False):
-            credit_score += 15
-        
-        scores['credit_card'] = min(credit_score, 100)
-        
-        # FX Exchange
-        fx_score = 0
+        travel_spend = analysis['transaction_stats'].get('travel_spend', 0)
+        total_spend = analysis['transaction_stats'].get('total_spend', 1)
+        travel_ratio = travel_spend / total_spend
+        travel_score += min(travel_ratio * 200, 70) # 200 to scale up the ratio
         if analysis['fx_activity']['has_fx_activity']:
-            fx_score = 50
-            if analysis['fx_activity']['fx_volume'] > 100000:
-                fx_score = 70
-            if analysis['fx_activity']['fx_volume'] > 500000:
-                fx_score = 90
+            travel_score += 30
+        scores['travel_card'] = travel_score
+
+        # 2. Премиальная карта
+        premium_score = 0
+        premium_score += min(analysis['avg_balance'] / 2000000 * 40, 40)
+        premium_spend = analysis['transaction_stats'].get('premium_spend', 0)
+        premium_ratio = premium_spend / total_spend
+        premium_score += min(premium_ratio * 200, 40)
+        if analysis['transfer_stats'].get('atm_count', 0) > 5:
+            premium_score += 10
+        if analysis['status'] == 'Премиальный клиент':
+            premium_score += 10
+        scores['premium_card'] = premium_score
+
+        # 3. Кредитная карта
+        credit_score = 0
+        online_spend = analysis['transaction_stats'].get('online_spend', 0)
+        online_ratio = online_spend / total_spend
+        credit_score += min(online_ratio * 200, 50)
+        num_categories = len(analysis['transaction_stats'].get('category_spend', {}))
+        credit_score += min(num_categories * 2, 30)
+        if analysis['transfer_stats'].get('has_installments', False):
+            credit_score += 20
+        scores['credit_card'] = credit_score
+
+        # 4. Обмен валют
+        fx_score = 0
+        fx_volume = analysis['fx_activity'].get('fx_volume', 0)
+        fx_score += min(fx_volume / 500000 * 70, 70)
+        if analysis['fx_activity']['fx_spend'] > 0:
+            fx_score += 30
         scores['fx_exchange'] = fx_score
-        
-        # Cash Loan
+
+        # 5. Кредит наличными
         loan_score = 0
-        if analysis['transfer_stats']:
-            # Negative cash flow
-            if analysis['transfer_stats'].get('net_cashflow', 0) < -50000:
-                loan_score += 40
-            
-            # Low balance
-            if analysis['avg_balance'] < 100000:
-                loan_score += 30
-            
-            # Existing loan payments
-            if analysis['transfer_stats'].get('loan_payments', 0) > 0:
-                loan_score += 30
-        scores['cash_loan'] = min(loan_score, 100)
-        
-        # Deposits
-        deposit_base_score = 0
-        if analysis['avg_balance'] > 200000:
-            deposit_base_score = 40
+        net_cashflow = analysis['transfer_stats'].get('net_cashflow', 0)
+        if net_cashflow < -100000:
+            loan_score += 40
+        if analysis['avg_balance'] < 100000:
+            loan_score += 30
+        if analysis['transfer_stats'].get('loan_payments', 0) > 0:
+            loan_score += 30
+        scores['cash_loan'] = loan_score
+
+        # 6. Депозит мультивалютный
+        multi_deposit_score = 0
+        if analysis['avg_balance'] > 200000 and analysis['fx_activity']['has_fx_activity']:
+            multi_deposit_score += min(analysis['avg_balance'] / 1000000 * 60, 60)
+            multi_deposit_score += 40
+        scores['multi_deposit'] = multi_deposit_score
+
+        # 7. Депозит сберегательный
+        savings_deposit_score = 0
         if analysis['avg_balance'] > 500000:
-            deposit_base_score = 60
-        if analysis['avg_balance'] > 1000000:
-            deposit_base_score = 80
-        
-        # Multi-currency deposit
-        scores['multi_deposit'] = deposit_base_score if analysis['fx_activity']['has_fx_activity'] else 0
-        
-        # Savings deposit
-        low_volatility = False
-        if analysis['transaction_stats']:
-            volatility = analysis['transaction_stats'].get('spending_volatility', float('inf'))
-            low_volatility = volatility < 50000
-        scores['savings_deposit'] = deposit_base_score if low_volatility else deposit_base_score * 0.7
-        
-        # Accumulative deposit
-        scores['accumulative_deposit'] = deposit_base_score * 0.8 if analysis['avg_balance'] > 100000 else 0
-        
-        # Investments
+             savings_deposit_score += min(analysis['avg_balance'] / 3000000 * 80, 80)
+        volatility = analysis['transaction_stats'].get('spending_volatility', float('inf'))
+        if volatility < 100000:
+            savings_deposit_score += 20
+        scores['savings_deposit'] = savings_deposit_score
+
+        # 8. Депозит накопительный
+        accumulative_score = 0
+        monthly_cashflow = analysis['transfer_stats'].get('monthly_cashflow', {})
+        positive_months = [flow for flow in monthly_cashflow.values() if flow > 0]
+        if len(positive_months) >= 2:
+            accumulative_score += 60
+        if analysis['status'] == 'Студент':
+            accumulative_score += 20
+        scores['accumulative_deposit'] = accumulative_score
+
+        # 9. Инвестиции
         invest_score = 0
-        if analysis['avg_balance'] > 500000:
-            invest_score = 50
-            if analysis['age'] < 45:
-                invest_score += 20
-            if analysis['age'] < 35:
-                invest_score += 10
+        if analysis['avg_balance'] > 300000:
+            invest_score += min(analysis['avg_balance'] / 1500000 * 60, 60)
+        invest_score += max(0, 50 - analysis['age']) # Younger clients get higher score
         scores['investments'] = invest_score
         
-        # Gold
+        # 10. Золотые слитки
         gold_score = 0
-        if analysis['avg_balance'] > 1000000:
-            gold_score = 60
-        if analysis['avg_balance'] > 2000000:
-            gold_score = 80
+        if analysis['avg_balance'] > 1500000:
+            gold_score += min(analysis['avg_balance'] / 4000000 * 100, 100)
         scores['gold'] = gold_score
-        
+
         return scores
     
     def select_best_product(self, scores):
@@ -491,7 +464,7 @@ class BCCPushNotificationGenerator:
         else:
             return 'savings_deposit'
     
-    def generate_push_notification(self, analysis, product):
+    def generate_push_notification(self, analysis, product, scores):
         """Generate personalized push notification"""
         templates = {
             'travel_card': self._generate_travel_push,
@@ -507,140 +480,72 @@ class BCCPushNotificationGenerator:
         }
         
         generator = templates.get(product, self._generate_default_push)
-        return generator(analysis)
+        return generator(analysis, scores)
     
     def _format_amount(self, amount):
         """Format amount with spaces for thousands"""
         return f"{int(amount):,}".replace(',', ' ')
+
+    def _get_russian_month(self, month_period):
+        """Convert month period to Russian month name"""
+        month_map = {
+            1: 'январе', 2: 'феврале', 3: 'марте', 4: 'апреле',
+            5: 'мае', 6: 'июне', 7: 'июле', 8: 'августе',
+            9: 'сентябре', 10: 'октябре', 11: 'ноябре', 12: 'декабре'
+        }
+        return month_map.get(month_period.month)
     
-    def _generate_travel_push(self, analysis):
+    def _generate_travel_push(self, analysis, scores):
         name = analysis['name']
-        travel_spend = 0
-        taxi_spend = 0
-        
-        if analysis['transaction_stats']:
-            travel_spend = analysis['transaction_stats'].get('travel_spend', 0)
-            if 'category_spend' in analysis['transaction_stats']:
-                taxi_spend = analysis['transaction_stats']['category_spend'].get('Такси', 0)
-        
-        total_travel = travel_spend + taxi_spend
-        
-        if total_travel > 100000:
-            cashback = int(total_travel * 0.04)
-            return f"{name}, за 3 месяца {self._format_amount(total_travel)} ₸ на поездки. Карта для путешествий вернёт {self._format_amount(cashback)} ₸. Оформить карту."
-        elif analysis['fx_activity']['has_fx_activity']:
-            curr = analysis['fx_activity'].get('primary_fx_currency', 'USD')
-            return f"{name}, вы часто платите в {curr}. Тревел-карта даст выгодный курс и кешбэк. Открыть карту."
-        elif taxi_spend > 20000:
-            return f"{name}, {self._format_amount(taxi_spend)} ₸ на такси за месяц. С картой для путешествий вернётся 4%. Получить карту."
+        travel_spend = analysis['transaction_stats'].get('travel_spend', 0)
+        if travel_spend > 10000:
+            return f"{name}, вы много тратите на поездки. С картой для путешествий вы могли бы получать до 4% кешбэка. Оформить карту."
         else:
-            return f"{name}, планируете путешествие? Карта даст кешбэк до 4% на отели и билеты. Узнать больше."
-    
-    def _generate_premium_push(self, analysis):
+            return f"{name}, планируете путешествие? Наша карта для путешествий даст кешбэк до 4% на отели и билеты. Узнать больше."
+
+    def _generate_premium_push(self, analysis, scores):
         name = analysis['name']
-        balance = analysis['avg_balance']
-        
-        if balance > 1500000:
+        if analysis['avg_balance'] > 1000000:
             return f"{name}, ваш статус открывает премиум-привилегии. Кешбэк до 4% и бесплатное обслуживание. Оформить."
-        elif balance > 1000000:
-            return f"{name}, с балансом {self._format_amount(balance)} ₸ доступна премиум-карта. Повышенный кешбэк ждёт. Подключить."
         else:
-            premium_spend = 0
-            if analysis['transaction_stats']:
-                premium_spend = analysis['transaction_stats'].get('premium_spend', 0)
-            
-            if premium_spend > 50000:
-                return f"{name}, траты в премиум-категориях {self._format_amount(premium_spend)} ₸. Удвойте кешбэк премиум-картой. Получить."
-            else:
-                return f"{name}, премиальная карта даст больше возможностей и привилегий. Узнать условия."
-    
-    def _generate_credit_push(self, analysis):
+            return f"{name}, премиальная карта даст больше возможностей и повышенный кешбэк в любимых категориях. Узнать условия."
+
+    def _generate_credit_push(self, analysis, scores):
         name = analysis['name']
-        
-        if analysis['transaction_stats'] and analysis['transaction_stats'].get('top_categories'):
-            cats = analysis['transaction_stats']['top_categories'][:2]
-            cat_str = ' и '.join([cat for cat in cats if len(cat) < 20])  # Shorten long categories
-            if cat_str:
-                return f"{name}, любимые категории — {cat_str}. Кредитная карта даст до 10% кешбэка там. Оформить."
-        
-        online_spend = 0
-        if analysis['transaction_stats']:
-            online_spend = analysis['transaction_stats'].get('online_spend', 0)
-        
-        if online_spend > 30000:
-            return f"{name}, {self._format_amount(online_spend)} ₸ на онлайн-сервисы. Кредитная карта вернёт 10%. Получить карту."
-        else:
-            return f"{name}, кредитная карта с льготным периодом 60 дней и кешбэком до 10%. Узнать лимит."
-    
-    def _generate_fx_push(self, analysis):
+        top_cats = analysis['transaction_stats'].get('top_categories', [])
+        cat_str = ', '.join(top_cats[:2])
+        return f"{name}, ваши топ-категории — {cat_str}. Кредитная карта даёт до 10% в любимых категориях и на онлайн-сервисы. Оформить карту."
+
+    def _generate_fx_push(self, analysis, scores):
         name = analysis['name']
         curr = analysis['fx_activity'].get('primary_fx_currency', 'валюте')
-        fx_volume = analysis['fx_activity'].get('fx_volume', 0)
-        
-        if fx_volume > 100000:
-            return f"{name}, обмениваете {self._format_amount(fx_volume)} ₸ в {curr}. В приложении курс выгоднее. Настроить."
-        else:
-            return f"{name}, работаете с {curr}? Выгодный курс без скрытых комиссий в приложении. Попробовать."
-    
-    def _generate_loan_push(self, analysis):
+        return f"{name}, вы часто платите в {curr}. В приложении выгодный обмен и авто-покупка по целевому курсу. Настроить обмен."
+
+    def _generate_loan_push(self, analysis, scores):
         name = analysis['name']
-        cashflow = 0
-        if analysis['transfer_stats']:
-            cashflow = analysis['transfer_stats'].get('net_cashflow', 0)
-        
-        if cashflow < -100000:
-            return f"{name}, поможем с временным дефицитом средств. Кредит с удобными выплатами. Узнать лимит."
-        else:
-            return f"{name}, нужны средства на важные цели? Быстрое решение по кредиту. Подать заявку."
-    
-    def _generate_multi_deposit_push(self, analysis):
+        return f"{name}, если нужен запас на крупные траты — можно оформить кредит наличными с гибкими выплатами. Узнать доступный лимит."
+
+    def _generate_multi_deposit_push(self, analysis, scores):
         name = analysis['name']
-        balance = analysis['avg_balance']
-        
-        if balance > 1000000:
-            return f"{name}, {self._format_amount(balance)} ₸ могут работать в разных валютах. Мультивалютный вклад. Открыть."
-        else:
-            return f"{name}, сохраните средства в разных валютах с выгодной ставкой. Открыть вклад."
-    
-    def _generate_savings_push(self, analysis):
+        return f"{name}, у вас остаются свободные средства и вы активны в валюте. Разместите их на мультивалютном вкладе. Открыть вклад."
+
+    def _generate_savings_push(self, analysis, scores):
         name = analysis['name']
-        balance = analysis['avg_balance']
-        
-        if balance > 500000:
-            return f"{name}, свободные {self._format_amount(balance)} ₸ могут приносить доход. Вклад с максимальной ставкой. Разместить."
-        else:
-            return f"{name}, начните копить с выгодом. Сберегательный вклад под высокий процент. Открыть вклад."
-    
-    def _generate_accumulative_push(self, analysis):
+        return f"{name}, у вас остаются свободные средства. Разместите их на вкладе — удобно копить и получать вознаграждение. Открыть вклад."
+
+    def _generate_accumulative_push(self, analysis, scores):
         name = analysis['name']
-        balance = analysis['avg_balance']
-        
-        if balance > 200000:
-            return f"{name}, откладывайте регулярно и получайте проценты. Накопительный вклад ждёт. Начать копить."
-        else:
-            return f"{name}, даже небольшие суммы растут на накопительном вкладе. Открыть счёт."
-    
-    def _generate_investment_push(self, analysis):
+        return f"{name}, откладывайте регулярно и получайте проценты. Накопительный вклад ждёт. Начать копить."
+
+    def _generate_investment_push(self, analysis, scores):
         name = analysis['name']
-        age = analysis['age']
-        
-        if age < 35:
-            return f"{name}, самое время начать инвестировать. Брокерский счёт без комиссии для новичков. Открыть."
-        elif age < 45:
-            return f"{name}, готовы к инвестициям? Низкий порог входа и поддержка на старте. Начать инвестировать."
-        else:
-            return f"{name}, диверсифицируйте накопления через инвестиции. Персональная консультация. Узнать больше."
-    
-    def _generate_gold_push(self, analysis):
+        return f"{name}, попробуйте инвестиции с низким порогом входа и без комиссий на старт. Открыть счёт."
+
+    def _generate_gold_push(self, analysis, scores):
         name = analysis['name']
-        balance = analysis['avg_balance']
-        
-        if balance > 2000000:
-            return f"{name}, с капиталом {self._format_amount(balance)} ₸ важна диверсификация. Золото защитит средства. Купить."
-        else:
-            return f"{name}, золотые слитки — надёжная защита капитала от инфляции. Узнать условия."
+        return f"{name}, золотые слитки — надёжная защита капитала от инфляции. Узнать условия."
     
-    def _generate_default_push(self, analysis):
+    def _generate_default_push(self, analysis, scores):
         name = analysis['name']
         return f"{name}, у нас есть выгодное предложение специально для вас. Узнать подробности."
     
@@ -678,7 +583,7 @@ class BCCPushNotificationGenerator:
                 best_product = self.select_best_product(scores)
                 
                 # Generate push notification
-                push_text = self.generate_push_notification(analysis, best_product)
+                push_text = self.generate_push_notification(analysis, best_product, scores)
                 
                 # Store recommendation
                 self.recommendations.append({
