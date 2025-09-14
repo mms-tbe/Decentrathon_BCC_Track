@@ -228,6 +228,9 @@ class BCCPushNotificationGenerator:
         client_trans = self.transactions_df[self.transactions_df['client_code'] == client_code]
         client_transfers = self.transfers_df[self.transfers_df['client_code'] == client_code]
         
+        existing_products = []
+        if 'product' in client_trans.columns:
+            existing_products.extend(client_trans['product'].unique())
         analysis = {
             'client_code': client_code,
             'name': client_info.get('name', f'Клиент_{client_code}'),
@@ -237,7 +240,9 @@ class BCCPushNotificationGenerator:
             'avg_balance': client_info.get('avg_monthly_balance_KZT', 100000),
             'transaction_stats': self._analyze_transactions(client_trans),
             'transfer_stats': self._analyze_transfers(client_transfers),
-            'fx_activity': self._analyze_fx_activity(client_trans, client_transfers)
+            'fx_activity': self._analyze_fx_activity(client_trans, client_transfers),
+            'total_trans_amount': client_trans['amount'].sum(),
+            'total_transf_amount': client_transfers['amount'].sum()
         }
         
         return analysis
@@ -354,99 +359,60 @@ class BCCPushNotificationGenerator:
         }
     
     def calculate_product_scores(self, analysis):
-        """Calculate scores for each product based on signals"""
+        """Calculate scores for each product based on the new logic"""
         scores = {}
 
-        # 1. Карта для путешествий
-        travel_score = 0
+        # Premium Card
+        premium_score = (analysis['avg_balance'] / 2000000 * 50) + (analysis['total_transf_amount'] / 15000000 * 50)
+        if analysis['status'] in ['Премиальный клиент', 'Зарплатный клиент']:
+            premium_score += 10
+        scores['premium_card'] = min(premium_score, 100)
+
+        # Credit Card
+        credit_score = (1 - analysis['avg_balance'] / 2000000 * 50) + (1 - analysis['age'] / 60 * 50)
+        if analysis['status'] in ['Студент', 'Стандартный клиент']:
+            credit_score += 10
+        scores['credit_card'] = min(credit_score, 100)
+
+        # Investments
+        invest_score = (analysis['avg_balance'] / 2000000 * 40) + (analysis['total_trans_amount'] / 10000000 * 60)
+        scores['investments'] = min(invest_score, 100)
+
+        # Other products (using previous signal-based logic, adjusted)
         travel_spend = analysis['transaction_stats'].get('travel_spend', 0)
         total_spend = analysis['transaction_stats'].get('total_spend', 1)
         travel_ratio = travel_spend / total_spend
-        travel_score += min(travel_ratio * 200, 70) # 200 to scale up the ratio
-        if analysis['fx_activity']['has_fx_activity']:
-            travel_score += 30
-        scores['travel_card'] = travel_score
+        scores['travel_card'] = min(travel_ratio * 200, 70) + (30 if analysis['fx_activity']['has_fx_activity'] else 0)
 
-        # 2. Премиальная карта
-        premium_score = 0
-        premium_score += min(analysis['avg_balance'] / 2000000 * 40, 40)
-        premium_spend = analysis['transaction_stats'].get('premium_spend', 0)
-        premium_ratio = premium_spend / total_spend
-        premium_score += min(premium_ratio * 200, 40)
-        if analysis['transfer_stats'].get('atm_count', 0) > 5:
-            premium_score += 10
-        if analysis['status'] == 'Премиальный клиент':
-            premium_score += 10
-        scores['premium_card'] = premium_score
-
-        # 3. Кредитная карта
-        credit_score = 0
-        online_spend = analysis['transaction_stats'].get('online_spend', 0)
-        online_ratio = online_spend / total_spend
-        credit_score += min(online_ratio * 200, 50)
-        num_categories = len(analysis['transaction_stats'].get('category_spend', {}))
-        credit_score += min(num_categories * 2, 30)
-        if analysis['transfer_stats'].get('has_installments', False):
-            credit_score += 20
-        scores['credit_card'] = credit_score
-
-        # 4. Обмен валют
-        fx_score = 0
         fx_volume = analysis['fx_activity'].get('fx_volume', 0)
-        fx_score += min(fx_volume / 500000 * 70, 70)
-        if analysis['fx_activity']['fx_spend'] > 0:
-            fx_score += 30
-        scores['fx_exchange'] = fx_score
+        scores['fx_exchange'] = min(fx_volume / 500000 * 70, 70) + (30 if analysis['fx_activity']['fx_spend'] > 0 else 0)
 
-        # 5. Кредит наличными
         loan_score = 0
-        net_cashflow = analysis['transfer_stats'].get('net_cashflow', 0)
-        if net_cashflow < -100000:
-            loan_score += 40
-        if analysis['avg_balance'] < 100000:
-            loan_score += 30
-        if analysis['transfer_stats'].get('loan_payments', 0) > 0:
-            loan_score += 30
+        if analysis['transfer_stats'].get('net_cashflow', 0) < -100000: loan_score += 40
+        if analysis['avg_balance'] < 100000: loan_score += 30
+        if analysis['transfer_stats'].get('loan_payments', 0) > 0: loan_score += 30
         scores['cash_loan'] = loan_score
 
-        # 6. Депозит мультивалютный
         multi_deposit_score = 0
         if analysis['avg_balance'] > 200000 and analysis['fx_activity']['has_fx_activity']:
-            multi_deposit_score += min(analysis['avg_balance'] / 1000000 * 60, 60)
-            multi_deposit_score += 40
+            multi_deposit_score = min(analysis['avg_balance'] / 1000000 * 60, 60) + 40
         scores['multi_deposit'] = multi_deposit_score
 
-        # 7. Депозит сберегательный
         savings_deposit_score = 0
         if analysis['avg_balance'] > 500000:
-             savings_deposit_score += min(analysis['avg_balance'] / 3000000 * 80, 80)
-        volatility = analysis['transaction_stats'].get('spending_volatility', float('inf'))
-        if volatility < 100000:
+             savings_deposit_score = min(analysis['avg_balance'] / 3000000 * 80, 80)
+        if analysis['transaction_stats'].get('spending_volatility', float('inf')) < 100000:
             savings_deposit_score += 20
         scores['savings_deposit'] = savings_deposit_score
 
-        # 8. Депозит накопительный
         accumulative_score = 0
-        monthly_cashflow = analysis['transfer_stats'].get('monthly_cashflow', {})
-        positive_months = [flow for flow in monthly_cashflow.values() if flow > 0]
-        if len(positive_months) >= 2:
+        if len([flow for flow in analysis['transfer_stats'].get('monthly_cashflow', {}).values() if flow > 0]) >= 2:
             accumulative_score += 60
         if analysis['status'] == 'Студент':
             accumulative_score += 20
         scores['accumulative_deposit'] = accumulative_score
 
-        # 9. Инвестиции
-        invest_score = 0
-        if analysis['avg_balance'] > 300000:
-            invest_score += min(analysis['avg_balance'] / 1500000 * 60, 60)
-        invest_score += max(0, 50 - analysis['age']) # Younger clients get higher score
-        scores['investments'] = invest_score
-        
-        # 10. Золотые слитки
-        gold_score = 0
-        if analysis['avg_balance'] > 1500000:
-            gold_score += min(analysis['avg_balance'] / 4000000 * 100, 100)
-        scores['gold'] = gold_score
+        scores['gold'] = min(analysis['avg_balance'] / 4000000 * 100, 100) if analysis['avg_balance'] > 1500000 else 0
 
         return scores
     

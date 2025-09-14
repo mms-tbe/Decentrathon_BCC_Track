@@ -37,23 +37,13 @@ class BCCFileOrganizer:
         # Define patterns for each file type
         patterns = {
             'clients': [
-                '**/client*.csv',
-                '**/profile*.csv',
-                '**/customer*.csv',
-                '**/клиент*.csv'
+                'clients.csv'
             ],
             'transactions': [
-                '**/transaction*.csv',
-                '**/trans*.csv',
-                '**/payment*.csv',
-                '**/транзакц*.csv',
-                '**/покуп*.csv'
+                'Transactions/*.csv'
             ],
             'transfers': [
-                '**/transfer*.csv',
-                '**/перевод*.csv',
-                '**/withdrawal*.csv',
-                '**/deposit*.csv'
+                'Transfers/*.csv'
             ]
         }
         
